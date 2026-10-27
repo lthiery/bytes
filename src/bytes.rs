@@ -1,5 +1,6 @@
+use core::any::TypeId;
 use core::mem::{self, ManuallyDrop, MaybeUninit};
-use core::ops::{Deref, RangeBounds};
+use core::ops::{Deref, Range, RangeBounds};
 use core::ptr::NonNull;
 use core::{cmp, fmt, hash, ptr, slice};
 
@@ -122,6 +123,9 @@ pub(crate) struct Vtable {
     pub is_unique: unsafe fn(&AtomicPtr<()>) -> bool,
     /// fn(data, ptr, len)
     pub drop: unsafe fn(*mut (), *const u8, usize),
+    /// The type of the owner passed to `from_owner`, if `data` points at an
+    /// `Owned<T>`.
+    pub owner_type_id: fn() -> Option<TypeId>,
 }
 
 impl Bytes {
@@ -272,6 +276,7 @@ impl Bytes {
 
         let owned = Box::into_raw(Box::new(Owned {
             ref_cnt: AtomicUsize::new(1),
+            buf_ptr: NonNull::dangling().as_ptr(),
             owner,
         }));
 
@@ -282,11 +287,71 @@ impl Bytes {
             vtable: &Owned::<T>::VTABLE,
         };
 
-        let buf = unsafe { &*owned }.owner.as_ref();
+        let buf = unsafe { &(*owned).owner }.as_ref();
         ret.ptr = buf.as_ptr();
         ret.len = buf.len();
+        // Only `owner` is borrowed above, so writing the sibling field is fine.
+        unsafe { ptr::addr_of_mut!((*owned).buf_ptr).write(ret.ptr) };
 
         ret
+    }
+
+    /// Returns the owner passed to [from_owner](Bytes::from_owner) if it is a
+    /// `T`, together with the range of the owner's buffer that `self` covers.
+    ///
+    /// Returns `None` if `self` was not constructed via `from_owner` or if the
+    /// owner is not a `T`. Slicing or truncating to an empty `Bytes` releases
+    /// the owner, so such values also return `None`.
+    ///
+    /// `T` must be [Sync] because clones of `self` on other threads may call
+    /// this method at the same time and share the returned reference.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bytes::Bytes;
+    ///
+    /// struct Frame {
+    ///     seq: u32,
+    ///     payload: Vec<u8>,
+    /// }
+    ///
+    /// impl AsRef<[u8]> for Frame {
+    ///     fn as_ref(&self) -> &[u8] {
+    ///         &self.payload
+    ///     }
+    /// }
+    ///
+    /// let frame = Frame { seq: 7, payload: b"hello world".to_vec() };
+    /// let b = Bytes::from_owner(frame).slice(6..);
+    ///
+    /// let (frame, range) = b.downcast_owner::<Frame>().unwrap();
+    /// assert_eq!(frame.seq, 7);
+    /// assert_eq!(range, 6..11);
+    /// assert_eq!(&frame.payload[range], &b[..]);
+    ///
+    /// assert!(b.downcast_owner::<Vec<u8>>().is_none());
+    /// assert!(Bytes::from_static(b"static").downcast_owner::<Frame>().is_none());
+    /// ```
+    pub fn downcast_owner<T>(&self) -> Option<(&T, Range<usize>)>
+    where
+        T: Sync + 'static,
+    {
+        if (self.vtable.owner_type_id)() != Some(TypeId::of::<T>()) {
+            return None;
+        }
+
+        // SAFETY: the vtable says `data` points at the `Owned<T>` created by
+        // `from_owner`. It lives, unmoved, until the last clone is dropped,
+        // and `self` holds one of the counted references. Only `owner` is
+        // borrowed; `ref_cnt` may be modified concurrently by other clones.
+        let owned = self.data.load(Ordering::Relaxed).cast::<Owned<T>>();
+        let (owner, buf_ptr) = unsafe { (&(*owned).owner, (*owned).buf_ptr) };
+
+        // `ptr` stays inside the owner's buffer through `slice`, `split_*`,
+        // `advance` and `truncate`, so this cannot underflow.
+        let start = self.ptr as usize - buf_ptr as usize;
+        Some((owner, start..start + self.len))
     }
 
     /// Returns the number of bytes contained in this `Bytes`.
@@ -1070,6 +1135,7 @@ const STATIC_VTABLE: Vtable = Vtable {
     into_mut: static_to_mut,
     is_unique: static_is_unique,
     drop: static_drop,
+    owner_type_id: no_owner,
 };
 
 unsafe fn static_clone(_: &AtomicPtr<()>, ptr: *const u8, len: usize) -> Bytes {
@@ -1100,20 +1166,31 @@ unsafe fn static_drop(_: *mut (), _: *const u8, _: usize) {
 #[repr(C)]
 struct Owned<T> {
     ref_cnt: AtomicUsize,
+    /// Start of the buffer `owner.as_ref()` returned in `from_owner`.
+    buf_ptr: *const u8,
     owner: T,
 }
 
-impl<T> Owned<T> {
+impl<T: 'static> Owned<T> {
     const VTABLE: Vtable = Vtable {
         clone: owned_clone::<T>,
         into_vec: owned_to_vec::<T>,
         into_mut: owned_to_mut::<T>,
         is_unique: owned_is_unique,
         drop: owned_drop::<T>,
+        owner_type_id: owned_type_id::<T>,
     };
 }
 
-unsafe fn owned_clone<T>(data: &AtomicPtr<()>, ptr: *const u8, len: usize) -> Bytes {
+pub(crate) fn no_owner() -> Option<TypeId> {
+    None
+}
+
+fn owned_type_id<T: 'static>() -> Option<TypeId> {
+    Some(TypeId::of::<T>())
+}
+
+unsafe fn owned_clone<T: 'static>(data: &AtomicPtr<()>, ptr: *const u8, len: usize) -> Bytes {
     let owned = data.load(Ordering::Relaxed);
     let old_cnt = (*owned.cast::<AtomicUsize>()).fetch_add(1, Ordering::Relaxed);
     if old_cnt > usize::MAX >> 1 {
@@ -1173,6 +1250,7 @@ static PROMOTABLE_EVEN_VTABLE: Vtable = Vtable {
     into_mut: promotable_even_to_mut,
     is_unique: promotable_is_unique,
     drop: promotable_even_drop,
+    owner_type_id: no_owner,
 };
 
 static PROMOTABLE_ODD_VTABLE: Vtable = Vtable {
@@ -1181,6 +1259,7 @@ static PROMOTABLE_ODD_VTABLE: Vtable = Vtable {
     into_mut: promotable_odd_to_mut,
     is_unique: promotable_is_unique,
     drop: promotable_odd_drop,
+    owner_type_id: no_owner,
 };
 
 unsafe fn promotable_even_clone(data: &AtomicPtr<()>, ptr: *const u8, len: usize) -> Bytes {
@@ -1363,6 +1442,7 @@ static SHARED_VTABLE: Vtable = Vtable {
     into_mut: shared_to_mut,
     is_unique: shared_is_unique,
     drop: shared_drop,
+    owner_type_id: no_owner,
 };
 
 const KIND_ARC: usize = 0b0;

@@ -12,7 +12,7 @@ use alloc::{
 };
 
 use crate::buf::{IntoIter, UninitSlice};
-use crate::bytes::Vtable;
+use crate::bytes::{no_owner, Vtable};
 #[allow(unused)]
 use crate::loom::sync::atomic::AtomicMut;
 use crate::loom::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -1901,6 +1901,7 @@ static SHARED_VTABLE: Vtable = Vtable {
     into_mut: shared_v_to_mut,
     is_unique: shared_v_is_unique,
     drop: shared_v_drop,
+    owner_type_id: no_owner,
 };
 
 unsafe fn shared_v_clone(data: &AtomicPtr<()>, ptr: *const u8, len: usize) -> Bytes {

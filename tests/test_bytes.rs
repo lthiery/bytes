@@ -1790,6 +1790,73 @@ fn owned_safe_drop_on_as_ref_panic() {
     assert_eq!(drop_counter.get(), 1);
 }
 
+#[test]
+fn owned_downcast_owner() {
+    let buf: [u8; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    let drop_counter = SharedAtomicCounter::new();
+    let owner = OwnedTester::new(buf, drop_counter.clone());
+    let b1 = Bytes::from_owner(owner);
+
+    let (owner, range) = b1.downcast_owner::<OwnedTester<10>>().unwrap();
+    assert_eq!(owner.buf, buf);
+    assert_eq!(range, 0..10);
+
+    // Clones and sub-slices report their position within the owner.
+    let b2 = b1.clone().slice(2..8);
+    let (owner, range) = b2.downcast_owner::<OwnedTester<10>>().unwrap();
+    assert_eq!(range, 2..8);
+    assert_eq!(&owner.buf[range], &b2[..]);
+
+    let mut b3 = b2.clone();
+    b3.advance(1);
+    b3.truncate(3);
+    let (_, range) = b3.downcast_owner::<OwnedTester<10>>().unwrap();
+    assert_eq!(range, 3..6);
+    let b4 = b3.split_off(2);
+    assert_eq!(b3.downcast_owner::<OwnedTester<10>>().unwrap().1, 3..5);
+    assert_eq!(b4.downcast_owner::<OwnedTester<10>>().unwrap().1, 5..6);
+
+    // The owner is a different type.
+    assert!(b1.downcast_owner::<[u8; 10]>().is_none());
+    assert!(b1.downcast_owner::<Vec<u8>>().is_none());
+
+    drop((b1, b2, b3, b4));
+    assert_eq!(drop_counter.get(), 1);
+}
+
+#[test]
+fn owned_downcast_owner_empty() {
+    let b1 = Bytes::from_owner(Vec::<u8>::new());
+    assert_eq!(b1.downcast_owner::<Vec<u8>>().unwrap().1, 0..0);
+
+    // Slicing or truncating to empty drops the reference to the owner.
+    let b2 = Bytes::from_owner(vec![1u8, 2, 3]);
+    assert!(b2.slice(1..1).downcast_owner::<Vec<u8>>().is_none());
+    let mut b3 = b2.clone();
+    b3.clear();
+    assert!(b3.downcast_owner::<Vec<u8>>().is_none());
+    assert_eq!(b2.downcast_owner::<Vec<u8>>().unwrap().1, 0..3);
+}
+
+#[test]
+fn downcast_owner_without_owner() {
+    assert!(Bytes::from_static(b"static")
+        .downcast_owner::<&'static [u8]>()
+        .is_none());
+    assert!(Bytes::from(vec![1u8, 2, 3])
+        .downcast_owner::<Vec<u8>>()
+        .is_none());
+    assert!(Bytes::from(vec![1u8, 2, 3])
+        .slice(1..)
+        .downcast_owner::<Vec<u8>>()
+        .is_none());
+    assert!(BytesMut::from(&b"mut"[..])
+        .freeze()
+        .downcast_owner::<Vec<u8>>()
+        .is_none());
+    assert!(Bytes::new().downcast_owner::<Vec<u8>>().is_none());
+}
+
 /// Test `BytesMut::put` reuses allocation of `Bytes`.
 #[test]
 fn bytes_mut_put_bytes_specialization() {
